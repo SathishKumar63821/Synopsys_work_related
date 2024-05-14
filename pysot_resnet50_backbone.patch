@@ -1,0 +1,188 @@
+diff --git a/pysot/core/config.py b/pysot/core/config.py
+index 90959a0..c490353 100644
+--- a/pysot/core/config.py
++++ b/pysot/core/config.py
+@@ -288,3 +288,10 @@ __C.TRACK.MASK_THERSHOLD = 0.30
+ 
+ # Mask output size
+ __C.TRACK.MASK_OUTPUT_SIZE = 127
++
++# ------------------------------------------------------------------------ #
++# ONNX Model options
++# ------------------------------------------------------------------------ #
++
++# Enable onnx model
++__C.ONNX_MODEL = False
+\ No newline at end of file
+diff --git a/pysot/models/model_builder.py b/pysot/models/model_builder.py
+index c6d0d1e..5066680 100644
+--- a/pysot/models/model_builder.py
++++ b/pysot/models/model_builder.py
+@@ -7,6 +7,10 @@ from __future__ import unicode_literals
+ 
+ import torch.nn as nn
+ import torch.nn.functional as F
++import onnx
++import onnxruntime as ort
++import numpy
++import torch
+ 
+ from pysot.core.config import cfg
+ from pysot.models.loss import select_cross_entropy_loss, weight_l1_loss
+@@ -39,30 +43,48 @@ class ModelBuilder(nn.Module):
+ 
+             if cfg.REFINE.REFINE:
+                 self.refine_head = get_refine_head(cfg.REFINE.TYPE)
++        self.ort_session = "pysot.onnx"
++
+ 
+     def template(self, z):
+-        zf = self.backbone(z)
+-        if cfg.MASK.MASK:
+-            zf = zf[-1]
+-        if cfg.ADJUST.ADJUST:
+-            zf = self.neck(zf)
+-        self.zf = zf
++        if cfg.ONNX_MODEL:
++            self.onnx_ip0 = z.cpu().numpy()
++        else:
++            zf = self.backbone(z)
++            if cfg.MASK.MASK:
++                zf = zf[-1]
++            if cfg.ADJUST.ADJUST:
++                zf = self.neck(zf)
++            self.zf = zf
+ 
+     def track(self, x):
+-        xf = self.backbone(x)
+-        if cfg.MASK.MASK:
+-            self.xf = xf[:-1]
+-            xf = xf[-1]
+-        if cfg.ADJUST.ADJUST:
+-            xf = self.neck(xf)
+-        cls, loc = self.rpn_head(self.zf, xf)
+-        if cfg.MASK.MASK:
+-            mask, self.mask_corr_feature = self.mask_head(self.zf, xf)
+-        return {
+-                'cls': cls,
+-                'loc': loc,
+-                'mask': mask if cfg.MASK.MASK else None
++        if cfg.ONNX_MODEL:
++            onnx_x = x.cpu().numpy()
++            input0_name = self.ort_session.get_inputs()[0].name
++            input1_name = self.ort_session.get_inputs()[1].name
++            output0_name = self.ort_session.get_outputs()[0].name
++            output1_name = self.ort_session.get_outputs()[1].name
++            onnx_outputs = self.ort_session.run([output0_name,output1_name], {input0_name: self.onnx_ip0.astype(numpy.float32),input1_name: onnx_x.astype(numpy.float32)})
++            return {
++                'cls': torch.tensor(onnx_outputs[0]),
++                'loc': torch.tensor(onnx_outputs[1])
+                }
++        else:
++            xf = self.backbone(x)
++            if cfg.MASK.MASK:
++                self.xf = xf[:-1]
++                xf = xf[-1]
++            if cfg.ADJUST.ADJUST:
++                xf = self.neck(xf)
++            cls, loc = self.rpn_head(self.zf, xf)
++            if cfg.MASK.MASK:
++                mask, self.mask_corr_feature = self.mask_head(self.zf, xf)
++            return {
++            'cls': cls,
++            'loc': loc,
++            'mask': mask if cfg.MASK.MASK else None
++            }
++        
+ 
+     def mask_refine(self, pos):
+         return self.refine_head(self.xf, self.mask_corr_feature, pos)
+diff --git a/toolkit/datasets/video.py b/toolkit/datasets/video.py
+index 9063a1e..1b23a1e 100644
+--- a/toolkit/datasets/video.py
++++ b/toolkit/datasets/video.py
+@@ -15,7 +15,7 @@ class Video(object):
+         self.gt_traj = gt_rect
+         self.attr = attr
+         self.pred_trajs = {}
+-        self.img_names = [os.path.join(os.path.abspath(root), os.path.abspath(x)) for x in img_names]
++        self.img_names = [os.path.join(os.path.abspath(root), x) for x in img_names]
+         self.imgs = None
+ 
+         if load_img:
+diff --git a/tools/test.py b/tools/test.py
+index f1e61b5..b86caf4 100644
+--- a/tools/test.py
++++ b/tools/test.py
+@@ -11,6 +11,9 @@ import os
+ import cv2
+ import torch
+ import numpy as np
++import onnx
++import onnxruntime as ort
++from onnxsim import simplify
+ 
+ from pysot.core.config import cfg
+ from pysot.models.model_builder import ModelBuilder
+@@ -32,6 +35,8 @@ parser.add_argument('--video', default='', type=str,
+         help='eval one special video')
+ parser.add_argument('--vis', action='store_true',
+         help='whether visualzie result')
++parser.add_argument('--onnx_model', action='store_true',
++        help='run the onnx model')
+ args = parser.parse_args()
+ 
+ torch.set_num_threads(1)
+@@ -41,22 +46,49 @@ def main():
+     cfg.merge_from_file(args.config)
+ 
+     cur_dir = os.path.dirname(os.path.realpath(__file__))
+-    dataset_root = os.path.join(cur_dir, '../testing_dataset', args.dataset)
+-
+     # create model
+     model = ModelBuilder()
+ 
+     # load model
+     model = load_pretrain(model, args.snapshot).cuda().eval()
++    print(args.onnx_model)
++    if args.onnx_model:
++        class ConvertModel(torch.nn.Module):
++            def __init__(self, model):
++                super(ConvertModel, self).__init__()
++                self.model = model
+ 
++            def forward(self, x, y):
++                xf = self.model.backbone(x)
++                yf = self.model.backbone(y)
++                print(" cfg.ADJUST.ADJUST", cfg.ADJUST.ADJUST)
++                if cfg.ADJUST.ADJUST:
++                    xf = self.model.neck(xf)
++                    yf = self.model.neck(yf)
++                cls, loc = self.model.rpn_head(xf, yf)
++                return cls, loc
++        onnx_model = ConvertModel(model)
++        torch.save(model, "pysot.pt")
++        x = torch.randn(1, 3, 127, 127)
++        x = x.to("cuda")
++        y = torch.randn(1, 3, 255, 255)
++        y = y.to("cuda")
++        torch_out = torch.onnx.export(onnx_model, (x,y), "pysot.onnx", export_params=True, input_names=['input0','input1'],output_names=['cls','loc'])
++        onnx_model_pysot = onnx.load("pysot.onnx")
++        model_simp,check = simplify(onnx_model_pysot)
++        onnx.save(model_simp, "pysot_sim.onnx")
++        model.ort_session =  ort.InferenceSession("pysot_sim.onnx")
++        print("Model conversion is successful. Please check current Dir for models.")
++        cfg.ONNX_MODEL=True
++        pass
+     # build tracker
+     tracker = build_tracker(model)
++    dataset_root = os.path.join(cur_dir, '../testing_dataset', args.dataset)
+ 
+     # create dataset
+     dataset = DatasetFactory.create_dataset(name=args.dataset,
+                                             dataset_root=dataset_root,
+                                             load_img=False)
+-
+     model_name = args.snapshot.split('/')[-1].split('.')[0]
+     total_lost = 0
+     if args.dataset in ['VOT2016', 'VOT2018', 'VOT2019']:
